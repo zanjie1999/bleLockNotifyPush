@@ -17,13 +17,19 @@ TARGET_MAC = ""
 # 低于这个信号强度会自动锁屏
 RSSI_THRESHOLD = -75
 # 检查间隔
-CHECK_INTERVAL = 30
+CHECK_INTERVAL = 60
 # 通知转发的webhook ios可以用bark 两个{}是标题和内容的占位符 留空则不推送
 WEBHOOK_URL = "https://api.day.app/abcd/{}/{}"
 # 筛选应用名称 为空则全推送
 FILTER_APP_NAMES = ["微信", "企业微信"]
 
 
+# 打包用 参数传入
+# TARGET_MAC = sys.argv[1] if len(sys.argv) > 1 else ""
+# RSSI_THRESHOLD = int(sys.argv[2]) if len(sys.argv) > 2 else -80
+# CHECK_INTERVAL = int(sys.argv[3]) if len(sys.argv) > 3 else 60
+# WEBHOOK_URL = sys.argv[4] if len(sys.argv) > 4 else ""
+# FILTER_APP_NAMES = sys.argv[5].split(',') if len(sys.argv) > 5 else []
 
 # 实时 RSSI
 current_device_rssi = None
