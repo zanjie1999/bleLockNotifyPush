@@ -70,7 +70,7 @@ async def monitor_notifications():
                             await send_webhook(app_name, t, c)
                     processed_ids.add(n.id)
             if len(processed_ids) > 100: processed_ids.clear()
-            await asyncio.sleep(2)
+            await asyncio.sleep(5)
     except Exception as e:
         print(f"通知监控异常: {e}")
 
@@ -97,9 +97,12 @@ async def monitor_ble():
             now = asyncio.get_event_loop().time()
             # 判定 1: 如果超时没收到广播包，视为离开
             if now - last_seen_time > CHECK_INTERVAL:
-                print("找不到设备 -> 锁屏")
-                ctypes.windll.user32.LockWorkStation()
-                current_device_rssi = None # 重置
+                if current_device_rssi is None:
+                    print("找不到设备")
+                else:
+                    print("找不到设备 -> 锁屏")
+                    ctypes.windll.user32.LockWorkStation()
+                    current_device_rssi = None # 重置
                 # 离开时翻倍延迟
                 await asyncio.sleep(CHECK_INTERVAL)
             # 判定 2: 收到信号但太弱
