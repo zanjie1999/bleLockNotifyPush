@@ -1,9 +1,11 @@
 # Windows 蓝牙自动锁屏（感应钥匙） 通知转发
 
+你可以选择直接使用Releases中的EXE文件，或者:
+
 需要Python3  
 安装依赖
 ```
-pip install httpx bleak winrt-Windows.UI.Notifications winrt-Windows.UI.Notifications.Management
+pip install httpx bleak winrt-Windows.UI.Notifications winrt-Windows.UI.Notifications.Management winrt-Windows.Data.Xml.Dom
 ```
 
 使用文本编辑器打开文件，顶部的注释会教你怎么配置

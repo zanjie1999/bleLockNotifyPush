@@ -57,8 +57,8 @@ GA_ROOTOWNER = 3
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 WM_CLOSE = 0x0010
 WM_DESTROY = 0x0002
-ULONG_PTR = getattr(wintypes, "ULONG_PTR", wintypes.WPARAM)
 LRESULT = ctypes.c_ssize_t
+PUL = ctypes.POINTER(ctypes.c_ulong)
 WNDPROC = ctypes.WINFUNCTYPE(
     LRESULT,
     wintypes.HWND,
@@ -70,22 +70,45 @@ WNDPROC = ctypes.WINFUNCTYPE(
 
 class KEYBDINPUT(ctypes.Structure):
     _fields_ = [
-        ("wVk", wintypes.WORD),
-        ("wScan", wintypes.WORD),
-        ("dwFlags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", ULONG_PTR),
+        ("wVk", ctypes.c_ushort),
+        ("wScan", ctypes.c_ushort),
+        ("dwFlags", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("dwExtraInfo", PUL),
+    ]
+
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", ctypes.c_long),
+        ("dy", ctypes.c_long),
+        ("mouseData", ctypes.c_ulong),
+        ("dwFlags", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("dwExtraInfo", PUL),
+    ]
+
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", ctypes.c_ulong),
+        ("wParamL", ctypes.c_short),
+        ("wParamH", ctypes.c_ushort),
     ]
 
 
 class INPUTUNION(ctypes.Union):
-    _fields_ = [("ki", KEYBDINPUT)]
+    _fields_ = [
+        ("ki", KEYBDINPUT),
+        ("mi", MOUSEINPUT),
+        ("hi", HARDWAREINPUT),
+    ]
 
 
 class INPUT(ctypes.Structure):
     _fields_ = [
-        ("type", wintypes.DWORD),
-        ("u", INPUTUNION),
+        ("type", ctypes.c_ulong),
+        ("ii", INPUTUNION),
     ]
 
 
@@ -192,15 +215,29 @@ kernel32.GetModuleHandleW.restype = wintypes.HINSTANCE
 def wake_screen():
     """模拟一次 F14 按键，尝试点亮已熄灭的显示器。"""
     try:
-        inputs = (INPUT * 2)(
-            INPUT(type=INPUT_KEYBOARD, u=INPUTUNION(ki=KEYBDINPUT(wVk=VK_F14))),
-            INPUT(
-                type=INPUT_KEYBOARD,
-                u=INPUTUNION(ki=KEYBDINPUT(wVk=VK_F14, dwFlags=KEYEVENTF_KEYUP)),
+        extra = ctypes.c_ulong(0)
+        key_down = INPUT(
+            type=INPUT_KEYBOARD,
+            ii=INPUTUNION(
+                ki=KEYBDINPUT(
+                    wVk=VK_F14,
+                    dwExtraInfo=ctypes.pointer(extra),
+                )
             ),
         )
-        sent = user32.SendInput(len(inputs), inputs, ctypes.sizeof(INPUT))
-        if sent != len(inputs):
+        key_up = INPUT(
+            type=INPUT_KEYBOARD,
+            ii=INPUTUNION(
+                ki=KEYBDINPUT(
+                    wVk=VK_F14,
+                    dwFlags=KEYEVENTF_KEYUP,
+                    dwExtraInfo=ctypes.pointer(extra),
+                )
+            ),
+        )
+        sent_down = user32.SendInput(1, ctypes.byref(key_down), ctypes.sizeof(INPUT))
+        sent_up = user32.SendInput(1, ctypes.byref(key_up), ctypes.sizeof(INPUT))
+        if sent_down != 1 or sent_up != 1:
             raise ctypes.WinError(ctypes.get_last_error())
     except Exception as e:
         print(f"亮屏失败: {e}")
@@ -529,30 +566,31 @@ async def monitor_ble():
 
 async def scan_and_list_devices():
     """扫描模式：列出所有设备及其 RSSI"""
-    print("正在搜寻周围的 BLE 设备 (10s)...")
-    # return_adv=True 确保拿到 AdvertisementData 对象
-    devices_dict = await BleakScanner.discover(timeout=10.0, return_adv=True)
+    try:
+        print("正在搜寻周围的 BLE 设备 (10s)...")
+        # return_adv=True 确保拿到 AdvertisementData 对象
+        devices_dict = await BleakScanner.discover(timeout=10.0, return_adv=True)
 
-    print("\n" + "=" * 70)
-    print(f"{'名称':<30} | {'MAC 地址':<20} | RSSI")
-    print("-" * 70)
-    for addr, (device, adv) in devices_dict.items():
-        name = device.name if device.name else "Unknown"
-        print(f"{name:<30} | {addr:<20} | {adv.rssi} dBm")
-    print("=" * 70 + "\n")
-    sys.exit(0)
+        print("\n" + "=" * 70)
+        print(f"{'名称':<30} | {'MAC 地址':<20} | RSSI")
+        print("-" * 70)
+        for addr, (device, adv) in devices_dict.items():
+            name = device.name if device.name else "Unknown"
+            print(f"{name:<30} | {addr:<20} | {adv.rssi} dBm")
+        print("=" * 70 + "\n")
+    except Exception as e:
+        print(f"扫描异常: {e}")
 
 
 async def main():
+    tasks = []
     if not TARGET_MAC:
         await scan_and_list_devices()
-        return
-
-    loop = asyncio.get_running_loop()
-    tasks = [
-        monitor_ble(),
-        monitor_shell_flash(loop),
-    ]
+    else:
+        tasks.append(monitor_ble())
+    if FLASH_WATCH_PROCESS_NAMES:
+        loop = asyncio.get_running_loop()
+        tasks.append(monitor_shell_flash(loop))
     if WEBHOOK_URL:
         tasks.append(monitor_notifications())
     await asyncio.gather(*tasks)
@@ -563,3 +601,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n退出")
+
