@@ -549,9 +549,6 @@ async def monitor_ble():
                 else:
                     print("找不到设备 -> 锁屏")
                     user32.LockWorkStation()
-                    current_device_rssi = None  # 重置
-                # 离开时翻倍延迟
-                await asyncio.sleep(CHECK_INTERVAL)
             # 判定 2: 收到信号但太弱
             elif current_device_rssi is not None and current_device_rssi < RSSI_THRESHOLD:
                 print(f"信号太弱 ({current_device_rssi} dBm) -> 锁屏")
