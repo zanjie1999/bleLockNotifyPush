@@ -338,12 +338,24 @@ def send_local_toast(title, body):
         print(f"本地通知失败: {e}")
 
 
+def get_notification_texts(notification):
+    """提取通知里的文本内容，取不到时返回空列表。"""
+    try:
+        visual = notification.visual
+        bindings = visual.bindings
+        if not bindings or len(bindings) == 0:
+            return []
+        return [item.text for item in bindings[0].get_text_elements()]
+    except Exception:
+        return []
+
+
 async def send_webhook(app, title, content):
     print("转发通知:", title, content)
     # payload = {"app": app, "title": title, "content": content}
     try:
         async with httpx.AsyncClient() as client:
-            await client.get(WEBHOOK_URL.format(app + ":" + title, content), timeout=20)
+            await client.get(WEBHOOK_URL.format(app + ":" + title + time.strftime("(%I:%M)", time.localtime()), content), timeout=20)
     except Exception as e:
         print(f"Webhook 失败: {e}")
 
@@ -375,22 +387,30 @@ async def monitor_notifications():
 
         processed_ids = set()
         while True:
-            notifs = await listener.get_notifications_async(notifications.NotificationKinds.TOAST)
-            for n in notifs:
-                if n.id not in processed_ids:
-                    app_name = n.app_info.display_info.display_name
+            try:
+                notifs = await listener.get_notifications_async(notifications.NotificationKinds.TOAST)
+                for n in notifs:
+                    if n.id in processed_ids:
+                        continue
+
+                    texts = get_notification_texts(n.notification)
+                    try:
+                        app_name = n.app_info.display_info.display_name
+                    except Exception as e:
+                        # 程序发送的通知没有appinfo
+                        processed_ids.add(n.id)
+                        continue
                     print("通知应用:", app_name)
                     if not FILTER_APP_NAMES or any(target in app_name for target in FILTER_APP_NAMES):
-                        visual = n.notification.visual
-                        bindings = visual.bindings
-                        if bindings and len(bindings) > 0:
-                            texts = bindings[0].get_text_elements()
-                            t = texts[0].text if len(texts) > 0 else ""
-                            c = texts[1].text if len(texts) > 1 else ""
-                            await send_webhook(app_name, t, c)
+                        t = texts[0] if len(texts) > 0 else ""
+                        c = texts[1] if len(texts) > 1 else ""
+                        await send_webhook(app_name, t, c)
+
                     processed_ids.add(n.id)
-            if len(processed_ids) > 100:
-                processed_ids.clear()
+                if len(processed_ids) > 100:
+                    processed_ids.clear()
+            except Exception as e:
+                print(f"获取通知异常: {e}")
             await asyncio.sleep(5)
     except Exception as e:
         print(f"通知监控异常: {e}")
@@ -598,4 +618,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n退出")
-
