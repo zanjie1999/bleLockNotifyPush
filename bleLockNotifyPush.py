@@ -1,6 +1,6 @@
 # coding=utf-8
 
-import asyncio, ctypes, httpx, os, sys, threading, time
+import asyncio, ctypes, gc, httpx, os, sys, threading, time
 from ctypes import wintypes
 from bleak import BleakScanner
 
@@ -340,14 +340,62 @@ def send_local_toast(title, body):
 
 def get_notification_texts(notification):
     """提取通知里的文本内容，取不到时返回空列表。"""
+    visual = None
+    bindings = None
+    binding = None
+    text_elements = None
     try:
         visual = notification.visual
         bindings = visual.bindings
         if not bindings or len(bindings) == 0:
             return []
-        return [item.text for item in bindings[0].get_text_elements()]
+        binding = bindings[0]
+        text_elements = binding.get_text_elements()
+        return [item.text for item in text_elements]
     except Exception:
         return []
+    finally:
+        text_elements = None
+        binding = None
+        bindings = None
+        visual = None
+
+
+async def get_next_notification_text_snapshot(listener, processed_ids):
+    """每次只提取一条通知的正文文本，避免同批 WinRT 文本对象一起释放时崩溃。"""
+    notifs = await listener.get_notifications_async(notifications.NotificationKinds.TOAST)
+    try:
+        for user_notification in notifs:
+            notification_id = user_notification.id
+            if notification_id in processed_ids:
+                user_notification = None
+                continue
+            return {
+                "id": notification_id,
+                "texts": get_notification_texts(user_notification.notification),
+            }
+        return None
+    finally:
+        notifs = None
+        gc.collect()
+
+
+async def get_notification_app_name(listener, notification_id):
+    """在新的 WinRT 查询里读取 app_info，避免和正文文本对象混用。"""
+    notifs = await listener.get_notifications_async(notifications.NotificationKinds.TOAST)
+    try:
+        for user_notification in notifs:
+            if user_notification.id != notification_id:
+                user_notification = None
+                continue
+            try:
+                return user_notification.app_info.display_info.display_name
+            except Exception:
+                return None
+        return None
+    finally:
+        notifs = None
+        gc.collect()
 
 
 async def send_webhook(app, title, content):
@@ -361,19 +409,22 @@ async def send_webhook(app, title, content):
 
 
 async def handle_flash_event(process_name, body):
-    now = time.monotonic()
-    last_notify_time = flash_last_notify_time.get(process_name, 0)
-    if now - last_notify_time < FLASH_NOTIFY_COOLDOWN_SECONDS:
-        return
-    flash_last_notify_time[process_name] = now
+    try:
+        now = time.monotonic()
+        last_notify_time = flash_last_notify_time.get(process_name, 0)
+        if now - last_notify_time < FLASH_NOTIFY_COOLDOWN_SECONDS:
+            return
+        flash_last_notify_time[process_name] = now
 
-    display_name = format_process_name(process_name)
-    title = f"{display_name} 有新提醒"
-    body = body or "检测到闪烁提醒"
-    print("检测到闪烁提醒:", process_name, body)
-    send_local_toast(title, body)
-    if WEBHOOK_URL:
-        await send_webhook(display_name, "新提醒", body)
+        display_name = format_process_name(process_name)
+        title = f"{display_name} 有新提醒"
+        body = body or "检测到闪烁提醒"
+        print("检测到闪烁提醒:", process_name, body)
+        send_local_toast(title, body)
+        if WEBHOOK_URL:
+            await send_webhook(display_name, "新提醒", body)
+    except Exception as e:
+        print(f"闪烁提醒处理异常: {e}")
 
 
 async def monitor_notifications():
@@ -388,25 +439,32 @@ async def monitor_notifications():
         processed_ids = set()
         while True:
             try:
-                notifs = await listener.get_notifications_async(notifications.NotificationKinds.TOAST)
-                for n in notifs:
-                    if n.id in processed_ids:
+                while True:
+                    item = await get_next_notification_text_snapshot(listener, processed_ids)
+                    if not item:
+                        break
+
+                    notification_id = item["id"]
+                    app_name = await get_notification_app_name(listener, notification_id)
+                    if not app_name:
+                        # 程序发送的通知没有appinfo
+                        processed_ids.add(notification_id)
                         continue
 
-                    texts = get_notification_texts(n.notification)
-                    try:
-                        app_name = n.app_info.display_info.display_name
-                    except Exception as e:
-                        # 程序发送的通知没有appinfo
-                        processed_ids.add(n.id)
-                        continue
                     print("通知应用:", app_name)
-                    if not FILTER_APP_NAMES or any(target in app_name for target in FILTER_APP_NAMES):
+                    if not FILTER_APP_NAMES or any(
+                        target in app_name for target in FILTER_APP_NAMES
+                    ):
+                        texts = item["texts"]
                         t = texts[0] if len(texts) > 0 else ""
                         c = texts[1] if len(texts) > 1 else ""
                         await send_webhook(app_name, t, c)
 
-                    processed_ids.add(n.id)
+                    processed_ids.add(notification_id)
+
+                    # 文本和 app_info 分两次查询，每条之间稍作让步。
+                    await asyncio.sleep(0.2)
+
                 if len(processed_ids) > 100:
                     processed_ids.clear()
             except Exception as e:
@@ -425,6 +483,13 @@ async def monitor_shell_flash(loop):
     ready_event = threading.Event()
     state = {"error": None, "hwnd": None, "thread": None, "wndproc": None}
 
+    def process_flash_message(hwnd):
+        payload = resolve_flash_event(hwnd)
+        if not payload:
+            return
+        process_name, body = payload
+        asyncio.create_task(handle_flash_event(process_name, body))
+
     def flash_thread_target():
         shellhook_message_id = 0
         class_name = f"BleLockNotifyPushShellHook_{os.getpid()}"
@@ -437,15 +502,10 @@ async def monitor_shell_flash(loop):
         @WNDPROC
         def window_proc(hwnd, msg, wparam, lparam):
             if msg == shellhook_message_id and int(wparam) == HSHELL_FLASH:
-                payload = resolve_flash_event(lparam)
-                if payload and not loop.is_closed():
-                    process_name, body = payload
+                hwnd_value = int(lparam)
+                if not loop.is_closed():
                     try:
-                        loop.call_soon_threadsafe(
-                            lambda p=process_name, b=body: asyncio.create_task(
-                                handle_flash_event(p, b)
-                            )
-                        )
+                        loop.call_soon_threadsafe(process_flash_message, hwnd_value)
                     except RuntimeError:
                         pass
                 return 0
@@ -545,7 +605,7 @@ def detection_callback(device, advertisement_data):
     global current_device_rssi, last_seen_time
     if device.address.upper() == TARGET_MAC.upper():
         current_device_rssi = advertisement_data.rssi
-        last_seen_time = asyncio.get_event_loop().time()
+        last_seen_time = time.monotonic()
 
 
 async def monitor_ble():
@@ -554,14 +614,15 @@ async def monitor_ble():
     print(f"正在监听设备: {TARGET_MAC}")
 
     # 启动持续扫描
-    scanner = BleakScanner(detection_callback=detection_callback)
-    await scanner.start()
-
+    scanner = None
     try:
+        scanner = BleakScanner(detection_callback=detection_callback)
+        await scanner.start()
+
         while True:
             await asyncio.sleep(CHECK_INTERVAL)
 
-            now = asyncio.get_event_loop().time()
+            now = time.monotonic()
             # 判定 1: 如果超时没收到广播包，视为离开
             if now - last_seen_time > CHECK_INTERVAL:
                 if current_device_rssi is None:
@@ -577,8 +638,12 @@ async def monitor_ble():
                 print(f"当前信号强度:{current_device_rssi} dBm")
                 wake_screen()
     finally:
-        print("扫描停止")
-        await scanner.stop()
+        if scanner is not None:
+            print("扫描停止")
+            try:
+                await scanner.stop()
+            except Exception as e:
+                print(f"停止扫描失败: {e}")
 
 
 async def scan_and_list_devices():
@@ -610,7 +675,8 @@ async def main():
         tasks.append(monitor_shell_flash(loop))
     if WEBHOOK_URL:
         tasks.append(monitor_notifications())
-    await asyncio.gather(*tasks)
+    if tasks:
+        await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":
