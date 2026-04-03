@@ -436,6 +436,8 @@ async def monitor_notifications():
             print("错误：未获得通知访问权限。")
             return
 
+        print("正在监听通知:", ", ".join(FILTER_APP_NAMES) if FILTER_APP_NAMES else "全部应用")
+        print("推送到:", WEBHOOK_URL)
         processed_ids = set()
         while True:
             try:
@@ -452,9 +454,7 @@ async def monitor_notifications():
                         continue
 
                     print("通知应用:", app_name)
-                    if not FILTER_APP_NAMES or any(
-                        target in app_name for target in FILTER_APP_NAMES
-                    ):
+                    if not FILTER_APP_NAMES or any(target in app_name for target in FILTER_APP_NAMES):
                         texts = item["texts"]
                         t = texts[0] if len(texts) > 0 else ""
                         c = texts[1] if len(texts) > 1 else ""
@@ -629,10 +629,12 @@ async def monitor_ble():
                     print("找不到设备")
                 else:
                     print("找不到设备 -> 锁屏")
+                    current_device_rssi = None
                     user32.LockWorkStation()
             # 判定 2: 收到信号但太弱
             elif current_device_rssi is not None and current_device_rssi < RSSI_THRESHOLD:
                 print(f"信号太弱 ({current_device_rssi} dBm) -> 锁屏")
+                current_device_rssi = None
                 user32.LockWorkStation()
             else:
                 print(f"当前信号强度:{current_device_rssi} dBm")
