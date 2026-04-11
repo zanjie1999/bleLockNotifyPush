@@ -1,6 +1,6 @@
 # coding=utf-8
 
-import asyncio, ctypes, gc, httpx, os, sys, threading, time
+import asyncio, ctypes, gc, httpx, os, subprocess, sys, threading, time
 from ctypes import wintypes
 from bleak import BleakScanner
 
@@ -30,7 +30,8 @@ FLASH_WATCH_PROCESS_NAMES = ["Weixin.exe", "WXWork.exe"]
 FLASH_NOTIFY_COOLDOWN_SECONDS = 10
 # 本地 Windows Toast 通知使用的 AppID
 TOAST_APP_ID = "bleLockNotifyPush"
-
+# 锁屏时如果检测到媒体正在播放，则先发送一次播放/暂停键
+PAUSE_MEDIA_ON_LOCK = True
 
 # 打包用 参数传入
 # TARGET_MAC = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -45,13 +46,108 @@ TOAST_APP_ID = "bleLockNotifyPush"
 current_device_rssi = None
 last_seen_time = 0
 flash_last_notify_time = {}
+POWERSHELL_EXE = os.path.join(
+    os.environ.get("SystemRoot", r"C:\Windows"),
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "powershell.exe",
+)
+
+MEDIA_STATUS_CORE_AUDIO_POWERSHELL_SCRIPT = r"""
+try {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Threading;
+
+namespace AudioSessionProbe {
+    public enum EDataFlow { eRender = 0, eCapture = 1, eAll = 2 }
+    public enum ERole { eConsole = 0, eMultimedia = 1, eCommunications = 2 }
+
+    [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
+    public class MMDeviceEnumeratorComObject {}
+
+    [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IMMDeviceEnumerator {
+        int EnumAudioEndpoints(EDataFlow dataFlow, uint dwStateMask, out object ppDevices);
+        int GetDefaultAudioEndpoint(EDataFlow dataFlow, ERole role, out IMMDevice ppEndpoint);
+    }
+
+    [ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IMMDevice {
+        int Activate(ref Guid iid, uint dwClsCtx, IntPtr pActivationParams, [MarshalAs(UnmanagedType.IUnknown)] out object ppInterface);
+    }
+
+    [ComImport, Guid("C02216F6-8C67-4B5B-9D00-D008E73E0064"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IAudioMeterInformation {
+        int GetPeakValue(out float pfPeak);
+        int GetMeteringChannelCount(out int pnChannelCount);
+        int GetChannelsPeakValues(int u32ChannelCount, IntPtr afPeakValues);
+        int QueryHardwareSupport(out int pdwHardwareSupportMask);
+    }
+
+    public static class Detector {
+        private const uint CLSCTX_ALL = 23;
+
+        public static float GetRenderPeakMax(int sampleCount, int sampleDelayMs) {
+            var enumerator = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
+            IMMDevice device;
+            if (enumerator.GetDefaultAudioEndpoint(EDataFlow.eRender, ERole.eMultimedia, out device) != 0 || device == null) {
+                return 0f;
+            }
+
+            Guid iid = typeof(IAudioMeterInformation).GUID;
+            object meterObj;
+            if (device.Activate(ref iid, CLSCTX_ALL, IntPtr.Zero, out meterObj) != 0 || meterObj == null) {
+                return 0f;
+            }
+
+            var meter = (IAudioMeterInformation)meterObj;
+            float peakMax = 0f;
+            for (int i = 0; i < sampleCount; i++) {
+                float peak;
+                if (meter.GetPeakValue(out peak) == 0 && peak > peakMax) {
+                    peakMax = peak;
+                }
+                if (i < sampleCount - 1 && sampleDelayMs > 0) {
+                    Thread.Sleep(sampleDelayMs);
+                }
+            }
+            return peakMax;
+        }
+    }
+}
+"@ -ErrorAction Stop
+
+    $peakThreshold = 0.0015
+    $peakMax = [AudioSessionProbe.Detector]::GetRenderPeakMax(6, 70)
+
+    Write-Output ([string]::Format("{0:F6}", $peakMax))
+
+    if ($peakMax -ge $peakThreshold) {
+        Write-Output 'PLAYING'
+    }
+    else {
+        Write-Output 'NOT_PLAYING'
+    }
+    exit 0
+}
+catch {
+    Write-Error $_.Exception.Message
+    exit 1
+}
+"""
+
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_EXTENDEDKEY = 0x0001
 VK_F14 = 0x7D
+VK_MEDIA_PLAY_PAUSE = 0xB3
 HSHELL_FLASH = 0x8006
 GA_ROOTOWNER = 3
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -129,6 +225,8 @@ class WNDCLASSW(ctypes.Structure):
 
 user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
 user32.SendInput.restype = wintypes.UINT
+user32.LockWorkStation.argtypes = []
+user32.LockWorkStation.restype = wintypes.BOOL
 user32.DefWindowProcW.argtypes = [
     wintypes.HWND,
     wintypes.UINT,
@@ -212,33 +310,103 @@ kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
 kernel32.GetModuleHandleW.restype = wintypes.HINSTANCE
 
 
+def send_virtual_key(vk_code, is_extended=False):
+    """发送一次指定的虚拟按键（按下 + 抬起）。"""
+    key_down_flags = KEYEVENTF_EXTENDEDKEY if is_extended else 0
+    key_up_flags = KEYEVENTF_KEYUP | key_down_flags
+    extra = ctypes.c_ulong(0)
+    key_down = INPUT(
+        type=INPUT_KEYBOARD,
+        ii=INPUTUNION(
+            ki=KEYBDINPUT(
+                wVk=vk_code,
+                dwFlags=key_down_flags,
+                dwExtraInfo=ctypes.pointer(extra),
+            )
+        ),
+    )
+    key_up = INPUT(
+        type=INPUT_KEYBOARD,
+        ii=INPUTUNION(
+            ki=KEYBDINPUT(
+                wVk=vk_code,
+                dwFlags=key_up_flags,
+                dwExtraInfo=ctypes.pointer(extra),
+            )
+        ),
+    )
+    sent_down = user32.SendInput(1, ctypes.byref(key_down), ctypes.sizeof(INPUT))
+    sent_up = user32.SendInput(1, ctypes.byref(key_up), ctypes.sizeof(INPUT))
+    if sent_down != 1 or sent_up != 1:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def query_media_playback_status():
+    """使用 CoreAudio 检查系统媒体状态，返回是否播放bool。"""
+    try:
+        powershell_exe = POWERSHELL_EXE if os.path.exists(POWERSHELL_EXE) else "powershell"
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        result = subprocess.run(
+            [
+                powershell_exe,
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                MEDIA_STATUS_CORE_AUDIO_POWERSHELL_SCRIPT,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=creationflags,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.strip() or result.stdout or "未知错误"
+            print(f"CoreAudio 媒体状态检查失败: {stderr}")
+            return False
+
+        print(f"CoreAudio: {result.stdout.strip()}")
+
+        return "NOT_PLAYING" not in result.stdout
+    except Exception as e:
+        print(f"CoreAudio 媒体状态检查异常: {e}")
+        return False
+
+
+async def pause_media_if_playing():
+    """锁屏前如检测到媒体正在播放，则发送一次播放/暂停键。"""
+    if not PAUSE_MEDIA_ON_LOCK:
+        return
+
+    media_status = await asyncio.to_thread(query_media_playback_status)
+    if media_status:
+        try:
+            # 媒体按键属于扩展键，需带 KEYEVENTF_EXTENDEDKEY 才能在部分设备上生效。
+            send_virtual_key(VK_MEDIA_PLAY_PAUSE, is_extended=True)
+            print("检测到媒体正在播放，已发送播放/暂停按键")
+            await asyncio.sleep(1)
+            media_status = await asyncio.to_thread(query_media_playback_status)
+            if media_status:
+                print("还有声音，再按一次")
+                send_virtual_key(VK_MEDIA_PLAY_PAUSE, is_extended=True)
+        except Exception as e:
+            print(f"暂停媒体失败: {e}")
+
+
+
+
+async def lock_workstation_with_media_pause():
+    """锁屏前先尝试暂停正在播放的媒体。"""
+    await pause_media_if_playing()
+    if not user32.LockWorkStation():
+        print(f"锁屏失败: {ctypes.WinError(ctypes.get_last_error())}")
+
+
 def wake_screen():
     """模拟一次 F14 按键，尝试点亮已熄灭的显示器。"""
     try:
-        extra = ctypes.c_ulong(0)
-        key_down = INPUT(
-            type=INPUT_KEYBOARD,
-            ii=INPUTUNION(
-                ki=KEYBDINPUT(
-                    wVk=VK_F14,
-                    dwExtraInfo=ctypes.pointer(extra),
-                )
-            ),
-        )
-        key_up = INPUT(
-            type=INPUT_KEYBOARD,
-            ii=INPUTUNION(
-                ki=KEYBDINPUT(
-                    wVk=VK_F14,
-                    dwFlags=KEYEVENTF_KEYUP,
-                    dwExtraInfo=ctypes.pointer(extra),
-                )
-            ),
-        )
-        sent_down = user32.SendInput(1, ctypes.byref(key_down), ctypes.sizeof(INPUT))
-        sent_up = user32.SendInput(1, ctypes.byref(key_up), ctypes.sizeof(INPUT))
-        if sent_down != 1 or sent_up != 1:
-            raise ctypes.WinError(ctypes.get_last_error())
+        send_virtual_key(VK_F14)
     except Exception as e:
         print(f"亮屏失败: {e}")
 
@@ -439,6 +607,15 @@ async def monitor_notifications():
         print("正在监听通知:", ", ".join(FILTER_APP_NAMES) if FILTER_APP_NAMES else "全部应用")
         print("推送到:", WEBHOOK_URL)
         processed_ids = set()
+        startup_notifs = await listener.get_notifications_async(notifications.NotificationKinds.TOAST)
+        try:
+            for user_notification in startup_notifs:
+                processed_ids.add(user_notification.id)
+            print(f"启动时已忽略现有通知: {len(processed_ids)} 条")
+        finally:
+            startup_notifs = None
+            gc.collect()
+
         while True:
             try:
                 while True:
@@ -465,8 +642,15 @@ async def monitor_notifications():
                     # 文本和 app_info 分两次查询，每条之间稍作让步。
                     await asyncio.sleep(0.2)
 
-                if len(processed_ids) > 100:
-                    processed_ids.clear()
+                if len(processed_ids) > 300:
+                    current_notifs = await listener.get_notifications_async(
+                        notifications.NotificationKinds.TOAST
+                    )
+                    try:
+                        processed_ids = {user_notification.id for user_notification in current_notifs}
+                    finally:
+                        current_notifs = None
+                        gc.collect()
             except Exception as e:
                 print(f"获取通知异常: {e}")
             await asyncio.sleep(5)
@@ -630,12 +814,12 @@ async def monitor_ble():
                 else:
                     print("找不到设备 -> 锁屏")
                     current_device_rssi = None
-                    user32.LockWorkStation()
+                    await lock_workstation_with_media_pause()
             # 判定 2: 收到信号但太弱
             elif current_device_rssi is not None and current_device_rssi < RSSI_THRESHOLD:
                 print(f"信号太弱 ({current_device_rssi} dBm) -> 锁屏")
                 current_device_rssi = None
-                user32.LockWorkStation()
+                await lock_workstation_with_media_pause()
             else:
                 print(f"当前信号强度:{current_device_rssi} dBm")
                 wake_screen()
