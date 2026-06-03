@@ -3,6 +3,7 @@
 import asyncio, ctypes, gc, httpx, os, subprocess, sys, threading, time
 from ctypes import wintypes
 from bleak import BleakScanner
+from urllib.parse import quote
 
 import winrt.windows.ui.notifications.management as mgmt
 import winrt.windows.ui.notifications as notifications
@@ -571,7 +572,7 @@ async def send_webhook(app, title, content):
     # payload = {"app": app, "title": title, "content": content}
     try:
         async with httpx.AsyncClient() as client:
-            await client.get(WEBHOOK_URL.format(app + ":" + title + time.strftime("(%I:%M)", time.localtime()), content), timeout=20)
+            await client.get(WEBHOOK_URL.format(quote(app + ":" + title + time.strftime("(%I:%M)", time.localtime())), quote(content)), timeout=20)
     except Exception as e:
         print(f"Webhook 失败: {e}")
 
