@@ -17,15 +17,16 @@ import winrt.windows.ui.notifications as notifications
 # 手环或手机的蓝牙mac地址 为空时会扫描并输出所有设备
 TARGET_MAC = "AA:BB:CC:DD:EE:FF"
 # 低于这个信号强度会自动锁屏
-RSSI_THRESHOLD = -85
+RSSI_THRESHOLD = -120
 # 检查间隔
 CHECK_INTERVAL = 60
 # 通知转发的webhook ios可以用bark 两个{}是标题和内容的占位符 留空则不推送
 WEBHOOK_URL = "https://api.day.app//{}/{}"
 # 筛选应用名称 为空则全推送
-FILTER_APP_NAMES = ["微信", "企业微信"]
+FILTER_APP_NAMES = ["微信", "企业微信","Telegram Desktop", "Codex"]
 # 检查闪烁提醒的进程名 为空则不监听
 FLASH_WATCH_PROCESS_NAMES = ["Weixin.exe", "WXWork.exe"]
+#FLASH_WATCH_PROCESS_NAMES = ["Weixin.exe", "WXWork.exe","Telegram.exe"]
 
 # 闪烁提醒通知冷却时间 秒
 FLASH_NOTIFY_COOLDOWN_SECONDS = 10
@@ -805,25 +806,28 @@ async def monitor_ble():
         await scanner.start()
 
         while True:
-            await asyncio.sleep(CHECK_INTERVAL)
+            try:
+                await asyncio.sleep(CHECK_INTERVAL)
 
-            now = time.monotonic()
-            # 判定 1: 如果超时没收到广播包，视为离开
-            if now - last_seen_time > CHECK_INTERVAL:
-                if current_device_rssi is None:
-                    print("找不到设备")
-                else:
-                    print("找不到设备 -> 锁屏")
+                now = time.monotonic()
+                # 判定 1: 如果超时没收到广播包，视为离开
+                if now - last_seen_time > CHECK_INTERVAL:
+                    if current_device_rssi is None:
+                        print("找不到设备")
+                    else:
+                        print("找不到设备 -> 锁屏")
+                        current_device_rssi = None
+                        await lock_workstation_with_media_pause()
+                # 判定 2: 收到信号但太弱
+                elif current_device_rssi is not None and current_device_rssi < RSSI_THRESHOLD:
+                    print(f"信号太弱 ({current_device_rssi} dBm) -> 锁屏")
                     current_device_rssi = None
                     await lock_workstation_with_media_pause()
-            # 判定 2: 收到信号但太弱
-            elif current_device_rssi is not None and current_device_rssi < RSSI_THRESHOLD:
-                print(f"信号太弱 ({current_device_rssi} dBm) -> 锁屏")
-                current_device_rssi = None
-                await lock_workstation_with_media_pause()
-            else:
-                print(f"当前信号强度:{current_device_rssi} dBm")
-                wake_screen()
+                else:
+                    print(f"当前信号强度:{current_device_rssi} dBm")
+                    wake_screen()
+            except Exception as e:
+                print(f"蓝牙自动锁屏出现异常: {e}")
     finally:
         if scanner is not None:
             print("扫描停止")
