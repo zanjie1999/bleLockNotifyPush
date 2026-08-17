@@ -21,7 +21,7 @@ import winrt.windows.ui.notifications as notifications
 
 # Windows 蓝牙自动锁屏（感应钥匙） 通知转发
 # 装依赖 pip install httpx bleak winrt-Windows.UI.Notifications winrt-Windows.UI.Notifications.Management winrt-Windows.Data.Xml.Dom
-# zyyme 20260327
+# zyyme 20260327 v5.0
 
 
 # 手环或手机的蓝牙mac地址 为空时会扫描并输出所有设备
@@ -576,11 +576,14 @@ def read_wechat_session_messages():
 
     def read_messages():
         try:
-            root = auto.Control(searchDepth=10, ClassName="mmui::XView")
+            # 全局查找第一个 XView 不可靠：微信可能同时存在图片预览窗口，
+            # 且最小化时 UIA 的控件顺序会让预览/聊天区域的 XView 先被命中。
+            # 以微信主窗口作为搜索根，即使窗口最小化也能访问会话列表。
+            root = auto.WindowControl(searchDepth=1, ClassName="mmui::MainWindow")
             if not root or not root.Exists(
                 maxSearchSeconds=3, printIfNotExist=False
             ):
-                raise RuntimeError("未找到微信主窗口控件 mmui::XView")
+                raise RuntimeError("未找到微信主窗口控件 mmui::MainWindow")
         except Exception as e:
             raise RuntimeError(f"查找微信主窗口控件失败: {e}") from e
 
