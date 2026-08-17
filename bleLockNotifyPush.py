@@ -1,9 +1,19 @@
 # coding=utf-8
 
-import asyncio, ctypes, gc, httpx, os, subprocess, sys, threading, time
+import asyncio, ctypes, gc, httpx, os, re, subprocess, sys, threading, time, traceback
 from ctypes import wintypes
+
+# Bleak 的 WinRT 回调要求主线程使用 MTA；必须在 comtypes/uiautomation 导入前设置。
+if sys.platform == "win32":
+    sys.coinit_flags = 0
+
 from bleak import BleakScanner
 from urllib.parse import quote
+
+try:
+    import uiautomation as auto
+except ImportError:
+    auto = None
 
 import winrt.windows.ui.notifications.management as mgmt
 import winrt.windows.ui.notifications as notifications
@@ -30,6 +40,8 @@ FLASH_WATCH_PROCESS_NAMES = ["Weixin.exe", "WXWork.exe"]
 
 # 闪烁提醒通知冷却时间 秒
 FLASH_NOTIFY_COOLDOWN_SECONDS = 10
+# UIAutomation 短暂失败时，延迟兜底以等待后续闪烁事件的完整读取结果。
+WECHAT_FALLBACK_DELAY_SECONDS = 1
 # 本地 Windows Toast 通知使用的 AppID
 TOAST_APP_ID = "bleLockNotifyPush"
 # 锁屏时如果检测到媒体正在播放，则先发送一次播放/暂停键
@@ -48,6 +60,10 @@ PAUSE_MEDIA_ON_LOCK = True
 current_device_rssi = None
 last_seen_time = 0
 flash_last_notify_time = {}
+# 微信会话摘要缓存：key 是群聊/联系人名称，value 是消息内容及提醒标记。
+wechat_message_cache = {}
+wechat_message_cache_initialized = False
+wechat_fallback_task = None
 POWERSHELL_EXE = os.path.join(
     os.environ.get("SystemRoot", r"C:\Windows"),
     "System32",
@@ -435,6 +451,159 @@ def get_window_title(hwnd):
     return buf.value.strip()
 
 
+def find_uia_target(control, class_name, name, errors=None):
+    """递归查找指定 ClassName 和 Name 的 UIAutomation 控件。"""
+    try:
+        if control.ClassName == class_name and control.Name == name:
+            return control
+        for child in control.GetChildren():
+            result = find_uia_target(child, class_name, name, errors)
+            if result:
+                return result
+    except Exception as e:
+        if errors is not None:
+            errors.append(e)
+        pass
+    return None
+
+
+def get_uia_class_names(control, class_name, errors=None):
+    """提取控件树中指定 ClassName 控件的 Name。"""
+    names = []
+    try:
+        for child in control.GetChildren():
+            if child.ClassName == class_name:
+                names.append(child.Name or "")
+            names.extend(get_uia_class_names(child, class_name, errors))
+    except Exception as e:
+        if errors is not None:
+            errors.append(e)
+        pass
+    return names
+
+
+def parse_wechat_session_details(full_name):
+    """将微信 ChatSessionCell.Name 转为会话名称、内容和提醒标记。"""
+    if not full_name:
+        return None
+
+    lines = [line.strip() for line in re.split(r"\r?\n", full_name) if line.strip()]
+    if not lines:
+        return None
+
+    # “已置顶”是会话列表的界面标记，不是聊天内容；也可能单独占据首行。
+    lines = [line for line in lines if line != "已置顶"]
+    if not lines:
+        return None
+
+    # 私聊摘要常以 [9] 这类未读数开头，群名本身可能包含数字，不能去掉末尾数字。
+    key = re.sub(r"^已置顶\s*", "", lines[0]).strip()
+    key = re.sub(r"^\[\d+\]\s*", "", key).strip()
+    if not key:
+        return None
+
+    muted = False
+    mentioned = False
+    message_time = ""
+    content_lines = []
+    for line in lines[1:]:
+        if line == "消息免打扰":
+            muted = True
+            continue
+        if "[有人@我]" in line:
+            mentioned = True
+        if re.fullmatch(r"\d{1,2}:\d{2}|\d{1,2}/\d{1,2}", line):
+            message_time = line
+            continue
+        # 群聊中未读数可能和发送者摘要处于同一行。
+        line = re.sub(r"^\[\d+条\]\s*", "", line).strip()
+        line = re.sub(r"^已置顶\s*", "", line).strip()
+        if line:
+            content_lines.append(line)
+
+    return {
+        "content": "\n".join(content_lines),
+        "message_time": message_time,
+        "muted": muted,
+        "mentioned": mentioned,
+    }, key
+
+
+def is_wechat_clock_time(value):
+    """判断会话摘要中的时间是否为当天的 HH:MM。"""
+    return bool(value and re.fullmatch(r"\d{1,2}:\d{2}", value))
+
+
+def parse_wechat_session_name(full_name):
+    """将微信 ChatSessionCell.Name 转为 (会话名称, 消息内容)。"""
+    parsed = parse_wechat_session_details(full_name)
+    if not parsed:
+        return None
+    details, key = parsed
+    return key, details["content"]
+
+
+def read_wechat_session_messages():
+    """通过 UIAutomation 读取微信会话列表，返回 key -> 摘要信息。"""
+    if auto is None:
+        raise RuntimeError("uiautomation 未安装或导入失败")
+
+    def read_messages():
+        try:
+            root = auto.Control(searchDepth=10, ClassName="mmui::XView")
+            if not root or not root.Exists(
+                maxSearchSeconds=3, printIfNotExist=False
+            ):
+                raise RuntimeError("未找到微信主窗口控件 mmui::XView")
+        except Exception as e:
+            raise RuntimeError(f"查找微信主窗口控件失败: {e}") from e
+
+        try:
+            find_errors = []
+            x_tableview = find_uia_target(
+                root, "mmui::XTableView", "会话", find_errors
+            )
+            if not x_tableview:
+                detail = f"；遍历异常: {find_errors[-1]}" if find_errors else ""
+                raise RuntimeError(
+                    f"未找到会话列表控件 mmui::XTableView(Name=会话){detail}"
+                )
+        except Exception as e:
+            raise RuntimeError(f"查找微信会话列表失败: {e}") from e
+
+        messages = {}
+        read_errors = []
+        for full_name in get_uia_class_names(
+            x_tableview, "mmui::ChatSessionCell", read_errors
+        ):
+            parsed = parse_wechat_session_details(full_name)
+            if parsed:
+                details, key = parsed
+                messages[key] = details
+        if not messages:
+            detail = f"；读取异常: {read_errors[-1]}" if read_errors else ""
+            raise RuntimeError(
+                f"会话列表中未找到有效的 mmui::ChatSessionCell{detail}"
+            )
+        return messages
+
+    # to_thread 创建的线程没有主线程的 COM 状态，需要显式初始化 UIAutomation。
+    initializer = getattr(auto, "UIAutomationInitializerInThread", None)
+    if initializer:
+        with initializer():
+            return read_messages()
+    return read_messages()
+
+
+def get_latest_wechat_message():
+    """兼容旧调用：读取会话列表中最靠前的有效摘要。"""
+    messages = read_wechat_session_messages()
+    if not messages:
+        return None
+    key, details = next(iter(messages.items()))
+    return key, details["content"]
+
+
 def get_process_name_for_hwnd(hwnd):
     if not hwnd:
         return None, None
@@ -573,28 +742,179 @@ async def send_webhook(app, title, content):
     # payload = {"app": app, "title": title, "content": content}
     try:
         async with httpx.AsyncClient() as client:
-            await client.get(WEBHOOK_URL.format(quote(app + ":" + title + time.strftime("(%I:%M)", time.localtime())), quote(content)), timeout=20)
+            await client.get(
+                WEBHOOK_URL.format(
+                    quote(app + ":" + title + time.strftime("(%I:%M)", time.localtime()), safe=""),
+                    quote(content, safe=""),
+                ),
+                timeout=20,
+            )
     except Exception as e:
         print(f"Webhook 失败: {e}")
 
 
-async def handle_flash_event(process_name, body):
+async def initialize_wechat_message_cache():
+    """启动时保存微信当前会话摘要，避免把已有消息误判为新消息。"""
+    global wechat_message_cache, wechat_message_cache_initialized
+    if wechat_message_cache_initialized:
+        return
+
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            messages = await asyncio.to_thread(read_wechat_session_messages)
+            if messages is None:
+                raise RuntimeError("UIAutomation 返回空结果")
+            wechat_message_cache = messages
+            wechat_message_cache_initialized = True
+            print(f"微信会话基线已保存: {len(wechat_message_cache)} 条")
+            return
+        except Exception as e:
+            last_error = e
+            print(f"保存微信会话基线失败（第 {attempt}/3 次）: {e}")
+            traceback.print_exc()
+            if attempt < 3:
+                await asyncio.sleep(0.5)
+
+    print(f"微信会话基线读取失败，最后错误: {last_error}")
+    print("首次闪烁时将发送兜底提醒")
+
+
+async def get_changed_wechat_messages():
+    """读取全部微信会话并返回相对上次读取有变化的可推送消息。"""
+    global wechat_message_cache, wechat_message_cache_initialized
+
+    current_messages = await asyncio.to_thread(read_wechat_session_messages)
+    if current_messages is None:
+        return None
+    if not wechat_message_cache_initialized:
+        # 启动读取失败时，当前读取作为新的基线；仅明确 @我的消息可直接确认是提醒。
+        wechat_message_cache = current_messages
+        wechat_message_cache_initialized = True
+        bootstrap_messages = [
+            (key, current["content"])
+            for key, current in current_messages.items()
+            if current.get("content")
+            and is_wechat_clock_time(current.get("message_time"))
+            and current.get("mentioned")
+        ]
+        return bootstrap_messages or None
+
+    changed_messages = []
+    for key, current in current_messages.items():
+        if not current.get("content"):
+            # UIAutomation 读取到未完整渲染的会话时，不覆盖已有快照。
+            continue
+        if not current.get("message_time"):
+            # 没有最后接收时间时无法判断是否为新消息。
+            continue
+        previous = wechat_message_cache.get(key)
+        current_time = current.get("message_time")
+        if not is_wechat_clock_time(current_time):
+            # MM/DD 只表示历史消息，不作为新消息推送；同时更新快照。
+            wechat_message_cache[key] = current
+            continue
+        if previous:
+            previous_time = previous.get("message_time")
+            if (
+                previous_time == current_time
+                and previous.get("content") == current.get("content")
+            ):
+                continue
+
+        # 只合并本次成功读取到的会话，避免一次不完整的 UIA 树清空缓存。
+        wechat_message_cache[key] = current
+        # 免打扰消息不推送，但明确 @我 的消息需要推送。
+        if current.get("muted") and not current.get("mentioned"):
+            continue
+        changed_messages.append((key, current["content"]))
+
+    return changed_messages
+
+
+def cancel_wechat_fallback():
+    global wechat_fallback_task
+    if wechat_fallback_task and not wechat_fallback_task.done():
+        wechat_fallback_task.cancel()
+    wechat_fallback_task = None
+
+
+async def send_delayed_wechat_fallback(process_name, display_name, body):
     try:
+        await asyncio.sleep(WECHAT_FALLBACK_DELAY_SECONDS)
         now = time.monotonic()
         last_notify_time = flash_last_notify_time.get(process_name, 0)
         if now - last_notify_time < FLASH_NOTIFY_COOLDOWN_SECONDS:
             return
         flash_last_notify_time[process_name] = now
+        fallback_body = body or "检测到闪烁提醒"
+        title = f"{display_name} 有新提醒"
+        print("微信内容读取失败，发送兜底提醒:", fallback_body)
+        send_local_toast(title, fallback_body)
+        if WEBHOOK_URL:
+            await send_webhook(display_name, "新提醒", fallback_body)
+    except asyncio.CancelledError:
+        return
 
+
+def schedule_wechat_fallback(process_name, display_name, body):
+    global wechat_fallback_task
+    cancel_wechat_fallback()
+    wechat_fallback_task = asyncio.create_task(
+        send_delayed_wechat_fallback(process_name, display_name, body)
+    )
+
+
+async def handle_flash_event(process_name, body):
+    try:
         display_name = format_process_name(process_name)
+        if process_name.lower() == "weixin.exe":
+            try:
+                changed_messages = await get_changed_wechat_messages()
+            except Exception as e:
+                print(f"读取微信会话内容失败: {e}")
+                traceback.print_exc()
+                changed_messages = None
+
+            if changed_messages:
+                cancel_wechat_fallback()
+                title = "、".join(chat_name for chat_name, _ in changed_messages)
+                body = "\n\n".join(
+                    message_content for _, message_content in changed_messages
+                )
+                # 正文已成功推送，后续重复闪烁或短暂读取失败都进入同一冷却窗口。
+                flash_last_notify_time[process_name] = time.monotonic()
+                print("检测到微信闪烁提醒:", body)
+                send_local_toast(title, body)
+                if WEBHOOK_URL:
+                    await send_webhook(display_name, title, body)
+                return
+
+            # 读取成功但没有可推送的变化时，不发送错误的首条会话内容。
+            if changed_messages == []:
+                cancel_wechat_fallback()
+                return
+
+            # 读取失败时延迟兜底，避免随后成功的闪烁事件造成两条通知。
+            schedule_wechat_fallback(process_name, display_name, body)
+            return
+
+        # UIAutomation 读取失败时保留原有的冷却和兜底提示。
+        now = time.monotonic()
+        last_notify_time = flash_last_notify_time.get(process_name, 0)
+        if now - last_notify_time < FLASH_NOTIFY_COOLDOWN_SECONDS:
+            return
+        flash_last_notify_time[process_name] = now
         title = f"{display_name} 有新提醒"
         body = body or "检测到闪烁提醒"
+
         print("检测到闪烁提醒:", process_name, body)
         send_local_toast(title, body)
         if WEBHOOK_URL:
             await send_webhook(display_name, "新提醒", body)
     except Exception as e:
         print(f"闪烁提醒处理异常: {e}")
+        traceback.print_exc()
 
 
 async def monitor_notifications():
@@ -633,6 +953,15 @@ async def monitor_notifications():
                         continue
 
                     print("通知应用:", app_name)
+                    # 微信/企业微信由 ShellHook 闪烁监听负责读取会话正文，
+                    # 不再把同一条 Windows Toast 从另一条链路重复转发。
+                    if (
+                        any(target in app_name for target in ("微信", "企业微信"))
+                        and FLASH_WATCH_PROCESS_NAMES
+                    ):
+                        processed_ids.add(notification_id)
+                        continue
+
                     if not FILTER_APP_NAMES or any(target in app_name for target in FILTER_APP_NAMES):
                         texts = item["texts"]
                         t = texts[0] if len(texts) > 0 else ""
@@ -666,6 +995,8 @@ async def monitor_shell_flash(loop):
         return
 
     print("正在监听闪烁提醒:", ", ".join(FLASH_WATCH_PROCESS_NAMES))
+    if any(name.lower() == "weixin.exe" for name in FLASH_WATCH_PROCESS_NAMES):
+        await initialize_wechat_message_cache()
     ready_event = threading.Event()
     state = {"error": None, "hwnd": None, "thread": None, "wndproc": None}
 
