@@ -8,6 +8,12 @@
 pip install httpx bleak winrt-Windows.UI.Notifications winrt-Windows.UI.Notifications.Management winrt-Windows.Data.Xml.Dom
 ```
 
+如果你需要获取微信PC端消息列表中收到的具体消息，还需要安装
+```
+pip install uiautomation
+```
+
+
 使用文本编辑器打开文件，顶部的注释会教你怎么配置
 
 测试可用后，可以将后缀改成pyw（后台运行，不会显示任何界面），放到启动文件夹或是配置到“任务计划程序”中作为开机启动  
