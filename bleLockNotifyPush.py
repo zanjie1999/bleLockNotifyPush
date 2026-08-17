@@ -42,6 +42,8 @@ FLASH_WATCH_PROCESS_NAMES = ["Weixin.exe", "WXWork.exe"]
 FLASH_NOTIFY_COOLDOWN_SECONDS = 10
 # UIAutomation 短暂失败时，延迟兜底以等待后续闪烁事件的完整读取结果。
 WECHAT_FALLBACK_DELAY_SECONDS = 1
+# 微信聚合的公众号/服务号会话不转发。
+WECHAT_IGNORED_SESSION_NAMES = {"公众号", "服务号", "订阅号", "订阅号消息"}
 # 本地 Windows Toast 通知使用的 AppID
 TOAST_APP_ID = "bleLockNotifyPush"
 # 锁屏时如果检测到媒体正在播放，则先发送一次播放/暂停键
@@ -63,6 +65,7 @@ flash_last_notify_time = {}
 # 微信会话摘要缓存：key 是群聊/联系人名称，value 是消息内容及提醒标记。
 wechat_message_cache = {}
 wechat_message_cache_initialized = False
+wechat_message_cache_lock = asyncio.Lock()
 wechat_fallback_task = None
 POWERSHELL_EXE = os.path.join(
     os.environ.get("SystemRoot", r"C:\Windows"),
@@ -491,6 +494,7 @@ def parse_wechat_session_details(full_name):
     if not lines:
         return None
 
+    pinned = "已置顶" in lines
     # “已置顶”是会话列表的界面标记，不是聊天内容；也可能单独占据首行。
     lines = [line for line in lines if line != "已置顶"]
     if not lines:
@@ -498,7 +502,11 @@ def parse_wechat_session_details(full_name):
 
     # 私聊摘要常以 [9] 这类未读数开头，群名本身可能包含数字，不能去掉末尾数字。
     key = re.sub(r"^已置顶\s*", "", lines[0]).strip()
-    key = re.sub(r"^\[\d+\]\s*", "", key).strip()
+    unread_count = 0
+    key_unread_match = re.match(r"^\[(\d+)\]\s*", key)
+    if key_unread_match:
+        unread_count = int(key_unread_match.group(1))
+        key = key[key_unread_match.end():].strip()
     if not key:
         return None
 
@@ -510,13 +518,17 @@ def parse_wechat_session_details(full_name):
         if line == "消息免打扰":
             muted = True
             continue
-        if "[有人@我]" in line:
+        compact_line = re.sub(r"\s+", "", line)
+        if "[有人@我]" in compact_line:
             mentioned = True
         if re.fullmatch(r"\d{1,2}:\d{2}|\d{1,2}/\d{1,2}", line):
             message_time = line
             continue
         # 群聊中未读数可能和发送者摘要处于同一行。
-        line = re.sub(r"^\[\d+条\]\s*", "", line).strip()
+        content_unread_match = re.match(r"^\[(\d+)条\]\s*", line)
+        if content_unread_match:
+            unread_count = int(content_unread_match.group(1))
+            line = line[content_unread_match.end():].strip()
         line = re.sub(r"^已置顶\s*", "", line).strip()
         if line:
             content_lines.append(line)
@@ -526,12 +538,26 @@ def parse_wechat_session_details(full_name):
         "message_time": message_time,
         "muted": muted,
         "mentioned": mentioned,
+        "unread_count": unread_count,
+        "pinned": pinned,
     }, key
 
 
 def is_wechat_clock_time(value):
     """判断会话摘要中的时间是否为当天的 HH:MM。"""
     return bool(value and re.fullmatch(r"\d{1,2}:\d{2}", value))
+
+
+def is_recent_wechat_clock_time(value, tolerance_minutes=2):
+    """判断 HH:MM 是否接近当前时间，用于识别首次出现的新会话。"""
+    if not is_wechat_clock_time(value):
+        return False
+    hour, minute = (int(part) for part in value.split(":"))
+    now = time.localtime()
+    current_minutes = now.tm_hour * 60 + now.tm_min
+    message_minutes = hour * 60 + minute
+    difference = abs(current_minutes - message_minutes)
+    return min(difference, 24 * 60 - difference) <= tolerance_minutes
 
 
 def parse_wechat_session_name(full_name):
@@ -795,12 +821,22 @@ async def get_changed_wechat_messages():
             (key, current["content"])
             for key, current in current_messages.items()
             if current.get("content")
+            and key not in WECHAT_IGNORED_SESSION_NAMES
             and is_wechat_clock_time(current.get("message_time"))
             and current.get("mentioned")
         ]
         return bootstrap_messages or None
 
     changed_messages = []
+    first_unpinned_key = next(
+        (
+            key
+            for key, details in current_messages.items()
+            if not details.get("pinned")
+            and key not in WECHAT_IGNORED_SESSION_NAMES
+        ),
+        None,
+    )
     for key, current in current_messages.items():
         if not current.get("content"):
             # UIAutomation 读取到未完整渲染的会话时，不覆盖已有快照。
@@ -816,14 +852,28 @@ async def get_changed_wechat_messages():
             continue
         if previous:
             previous_time = previous.get("message_time")
-            if (
-                previous_time == current_time
-                and previous.get("content") == current.get("content")
-            ):
+            previous_unread_count = previous.get("unread_count", 0)
+            current_unread_count = current.get("unread_count", 0)
+            has_new_activity = (
+                previous_time != current_time
+                or previous.get("content") != current.get("content")
+                or current_unread_count > previous_unread_count
+                or (current.get("mentioned") and not previous.get("mentioned"))
+            )
+            if not has_new_activity:
                 continue
 
         # 只合并本次成功读取到的会话，避免一次不完整的 UIA 树清空缓存。
         wechat_message_cache[key] = current
+        if key in WECHAT_IGNORED_SESSION_NAMES:
+            continue
+        if previous is None:
+            # UIA 会话列表采用虚拟化加载。后续才读到的旧会话不能算更新；
+            # 真正的新会话只可能出现在置顶区之后的第一项，且时间接近当前时刻。
+            if key != first_unpinned_key or not (
+                current.get("unread_count", 0) > 0 or current.get("mentioned")
+            ) or not is_recent_wechat_clock_time(current_time):
+                continue
         # 免打扰消息不推送，但明确 @我 的消息需要推送。
         if current.get("muted") and not current.get("mentioned"):
             continue
@@ -870,7 +920,12 @@ async def handle_flash_event(process_name, body):
         display_name = format_process_name(process_name)
         if process_name.lower() == "weixin.exe":
             try:
-                changed_messages = await get_changed_wechat_messages()
+                async with wechat_message_cache_lock:
+                    changed_messages = await get_changed_wechat_messages()
+                    if changed_messages == []:
+                        # Shell 闪烁事件有时早于会话列表摘要刷新，短暂等待后复读一次。
+                        await asyncio.sleep(0.25)
+                        changed_messages = await get_changed_wechat_messages()
             except Exception as e:
                 print(f"读取微信会话内容失败: {e}")
                 traceback.print_exc()
