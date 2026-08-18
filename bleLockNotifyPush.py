@@ -41,7 +41,7 @@ FLASH_WATCH_PROCESS_NAMES = ["Weixin.exe", "WXWork.exe"]
 # 闪烁提醒通知冷却时间 秒
 FLASH_NOTIFY_COOLDOWN_SECONDS = 10
 # 收到微信闪烁事件后等待会话摘要刷新。
-WECHAT_READ_DELAY_SECONDS = 0.5
+WECHAT_READ_DELAY_SECONDS = 0.25
 # UIAutomation 短暂失败时，延迟兜底以等待后续闪烁事件的完整读取结果。
 WECHAT_FALLBACK_DELAY_SECONDS = 1
 # 微信聚合的公众号/服务号会话不转发。
@@ -835,7 +835,6 @@ async def get_changed_wechat_messages():
         )
         return [bootstrap_message] if bootstrap_message else None
 
-    latest_message = None
     first_unpinned_key = None
     for key, current in current_messages.items():
         if (
@@ -884,8 +883,7 @@ async def get_changed_wechat_messages():
         if current.get("muted") and not current.get("mentioned"):
             continue
         # 微信会话列表已按时间倒序，只保留第一条符合条件的变化消息。
-        if latest_message:
-            return [latest_message] if latest_message else []
+        return [(key, current["content"])]
 
 
 def cancel_wechat_fallback():
