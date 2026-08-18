@@ -21,7 +21,7 @@ import winrt.windows.ui.notifications as notifications
 
 # Windows 蓝牙自动锁屏（感应钥匙） 通知转发
 # 装依赖 pip install httpx bleak winrt-Windows.UI.Notifications winrt-Windows.UI.Notifications.Management winrt-Windows.Data.Xml.Dom
-# zyyme 20260327 v5.0
+# zyyme 20260327 v5.1
 
 
 # 手环或手机的蓝牙mac地址 为空时会扫描并输出所有设备
@@ -40,6 +40,8 @@ FLASH_WATCH_PROCESS_NAMES = ["Weixin.exe", "WXWork.exe"]
 
 # 闪烁提醒通知冷却时间 秒
 FLASH_NOTIFY_COOLDOWN_SECONDS = 10
+# 收到微信闪烁事件后等待会话摘要刷新。
+WECHAT_READ_DELAY_SECONDS = 0.5
 # UIAutomation 短暂失败时，延迟兜底以等待后续闪烁事件的完整读取结果。
 WECHAT_FALLBACK_DELAY_SECONDS = 1
 # 微信聚合的公众号/服务号会话不转发。
@@ -923,6 +925,7 @@ async def handle_flash_event(process_name, body):
         display_name = format_process_name(process_name)
         if process_name.lower() == "weixin.exe":
             try:
+                await asyncio.sleep(WECHAT_READ_DELAY_SECONDS)
                 async with wechat_message_cache_lock:
                     changed_messages = await get_changed_wechat_messages()
                     if changed_messages == []:
