@@ -822,27 +822,28 @@ async def get_changed_wechat_messages():
         # 启动读取失败时，当前读取作为新的基线；仅明确 @我的消息可直接确认是提醒。
         wechat_message_cache = current_messages
         wechat_message_cache_initialized = True
-        bootstrap_messages = [
-            (key, current["content"])
-            for key, current in current_messages.items()
-            if current.get("content")
-            and key not in WECHAT_IGNORED_SESSION_NAMES
-            and is_wechat_clock_time(current.get("message_time"))
-            and current.get("mentioned")
-        ]
-        return bootstrap_messages or None
+        bootstrap_message = next(
+            (
+                (key, current["content"])
+                for key, current in current_messages.items()
+                if current.get("content")
+                and key not in WECHAT_IGNORED_SESSION_NAMES
+                and is_wechat_clock_time(current.get("message_time"))
+                and current.get("mentioned")
+            ),
+            None,
+        )
+        return [bootstrap_message] if bootstrap_message else None
 
-    changed_messages = []
-    first_unpinned_key = next(
-        (
-            key
-            for key, details in current_messages.items()
-            if not details.get("pinned")
-            and key not in WECHAT_IGNORED_SESSION_NAMES
-        ),
-        None,
-    )
+    latest_message = None
+    first_unpinned_key = None
     for key, current in current_messages.items():
+        if (
+            first_unpinned_key is None
+            and not current.get("pinned")
+            and key not in WECHAT_IGNORED_SESSION_NAMES
+        ):
+            first_unpinned_key = key
         if not current.get("content"):
             # UIAutomation 读取到未完整渲染的会话时，不覆盖已有快照。
             continue
@@ -882,9 +883,11 @@ async def get_changed_wechat_messages():
         # 免打扰消息不推送，但明确 @我 的消息需要推送。
         if current.get("muted") and not current.get("mentioned"):
             continue
-        changed_messages.append((key, current["content"]))
+        # 微信会话列表已按时间倒序，只保留第一条符合条件的变化消息。
+        if latest_message is None:
+            latest_message = (key, current["content"])
 
-    return changed_messages
+    return [latest_message] if latest_message else []
 
 
 def cancel_wechat_fallback():
