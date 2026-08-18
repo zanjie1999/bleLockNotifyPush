@@ -884,10 +884,8 @@ async def get_changed_wechat_messages():
         if current.get("muted") and not current.get("mentioned"):
             continue
         # 微信会话列表已按时间倒序，只保留第一条符合条件的变化消息。
-        if latest_message is None:
-            latest_message = (key, current["content"])
-
-    return [latest_message] if latest_message else []
+        if latest_message:
+            return [latest_message] if latest_message else []
 
 
 def cancel_wechat_fallback():
